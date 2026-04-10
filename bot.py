@@ -1,6 +1,7 @@
-import discord
+import asyncio
 import re
 import os
+import discord
 import aiohttp
 from aiohttp import web
 
@@ -19,8 +20,6 @@ client = discord.Client(intents=intents)
 
 
 # ── KEEP-ALIVE WEB SERVER ─────────────────────────────────────────────────────
-# Render requires a service to bind to a port. This tiny HTTP server satisfies
-# that requirement and also acts as a health-check endpoint.
 
 async def handle_health(request):
     return web.Response(text="Bot is running ✅")
@@ -38,12 +37,9 @@ async def start_webserver():
 # ── POKEMON HELPERS ───────────────────────────────────────────────────────────
 
 def extract_pokemon_name_from_url(url: str) -> str | None:
-    """Pull dex number or name slug from Poketwo sprite URLs."""
-    # Dex number: .../132.png
     match = re.search(r"/(\d+)\.(?:png|gif|jpg|webp)(?:\?|$)", url)
     if match:
         return match.group(1)
-    # Name slug: .../bulbasaur.png
     match = re.search(r"/([a-z][a-z0-9\-]+)\.(?:png|gif|jpg|webp)(?:\?|$)", url)
     if match:
         return match.group(1)
@@ -51,7 +47,6 @@ def extract_pokemon_name_from_url(url: str) -> str | None:
 
 
 async def resolve_pokemon(identifier: str, session: aiohttp.ClientSession) -> str:
-    """Resolve a dex number or slug to a display name via PokéAPI."""
     url = f"https://pokeapi.co/api/v2/pokemon/{identifier.lower()}"
     async with session.get(url) as resp:
         if resp.status == 200:
@@ -76,7 +71,6 @@ def is_spawn_message(message: discord.Message) -> bool:
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
-    await start_webserver()
     print("Watching for Poketwo spawns…")
 
 
@@ -116,11 +110,15 @@ async def on_message(message: discord.Message):
     )
 
 
-import asyncio
+# ── MAIN ENTRYPOINT ───────────────────────────────────────────────────────────
+# 1. Bind the web server port FIRST so Render doesn't kill the process.
+# 2. Wait 5 s to avoid Discord/Cloudflare rate limits on fresh deploys.
+# 3. Start the Discord client — runs concurrently with the web server.
 
-async def start_bot():
-    await asyncio.sleep(10)  # delay to avoid rate limit
+async def main():
+    await start_webserver()
+    print("Waiting 5 s before Discord login to avoid rate limits…")
+    await asyncio.sleep(5)
     await client.start(TOKEN)
 
-loop = asyncio.get_event_loop()
-loop.run_until_complete(start_bot())
+asyncio.run(main())
