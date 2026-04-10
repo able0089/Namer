@@ -116,4 +116,10 @@ async def on_message(message: discord.Message):
     )
 
 
-client.run(TOKEN)
+import asyncio
+
+async def main():
+    await asyncio.sleep(10)  # wait before connecting
+    await client.start(TOKEN)
+
+asyncio.run(main())
