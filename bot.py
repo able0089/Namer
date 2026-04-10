@@ -118,8 +118,9 @@ async def on_message(message: discord.Message):
 
 import asyncio
 
-async def main():
-    await asyncio.sleep(10)  # wait before connecting
+async def start_bot():
+    await asyncio.sleep(10)  # delay to avoid rate limit
     await client.start(TOKEN)
 
-asyncio.run(main())
+loop = asyncio.get_event_loop()
+loop.run_until_complete(start_bot())
