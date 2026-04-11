@@ -1,17 +1,26 @@
 import asyncio
 import re
 import os
+import sys
+import traceback
 import discord
 import aiohttp
 from aiohttp import web
 
-# ── CONFIG (set these as Environment Variables in Render) ─────────────────────
-TOKEN = os.environ["DISCORD_TOKEN"]          # Required
-POKETWO_BOT_ID = 716390085896962058          # Official Poketwo bot ID
-PORT = int(os.environ.get("PORT", 8080))     # Render injects PORT automatically
-# Optional: comma-separated channel IDs e.g. "123456,789012"
+print("==> bot.py starting up", flush=True)
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+TOKEN = os.environ.get("DISCORD_TOKEN")
+if not TOKEN:
+    print("FATAL: DISCORD_TOKEN environment variable is not set!", flush=True)
+    sys.exit(1)
+
+POKETWO_BOT_ID = 716390085896962058
+PORT = int(os.environ.get("PORT", 8080))
 _raw = os.environ.get("WATCH_CHANNEL_IDS", "")
 WATCH_CHANNEL_IDS: set[int] = {int(x) for x in _raw.split(",") if x.strip()}
+
+print(f"==> Config loaded. PORT={PORT}", flush=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -31,7 +40,7 @@ async def start_webserver():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Keep-alive server listening on port {PORT}")
+    print(f"==> Web server listening on port {PORT}", flush=True)
 
 
 # ── POKEMON HELPERS ───────────────────────────────────────────────────────────
@@ -45,7 +54,6 @@ def extract_pokemon_name_from_url(url: str) -> str | None:
         return match.group(1)
     return None
 
-
 async def resolve_pokemon(identifier: str, session: aiohttp.ClientSession) -> str:
     url = f"https://pokeapi.co/api/v2/pokemon/{identifier.lower()}"
     async with session.get(url) as resp:
@@ -53,7 +61,6 @@ async def resolve_pokemon(identifier: str, session: aiohttp.ClientSession) -> st
             data = await resp.json()
             return data["name"].capitalize()
     return identifier.capitalize()
-
 
 def is_spawn_message(message: discord.Message) -> bool:
     if message.author.id != POKETWO_BOT_ID:
@@ -70,9 +77,8 @@ def is_spawn_message(message: discord.Message) -> bool:
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user} (ID: {client.user.id})")
-    print("Watching for Poketwo spawns…")
-
+    print(f"==> Logged in as {client.user} (ID: {client.user.id})", flush=True)
+    print("==> Watching for Poketwo spawns…", flush=True)
 
 @client.event
 async def on_message(message: discord.Message):
@@ -110,15 +116,25 @@ async def on_message(message: discord.Message):
     )
 
 
-# ── MAIN ENTRYPOINT ───────────────────────────────────────────────────────────
-# 1. Bind the web server port FIRST so Render doesn't kill the process.
-# 2. Wait 5 s to avoid Discord/Cloudflare rate limits on fresh deploys.
-# 3. Start the Discord client — runs concurrently with the web server.
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    await start_webserver()
-    print("Waiting 5 s before Discord login to avoid rate limits…")
-    await asyncio.sleep(5)
-    await client.start(TOKEN)
+    try:
+        print("==> Starting web server…", flush=True)
+        await start_webserver()
+
+        print("==> Waiting 5 s before Discord login…", flush=True)
+        await asyncio.sleep(5)
+
+        print("==> Connecting to Discord…", flush=True)
+        await client.start(TOKEN)
+
+    except discord.LoginFailure:
+        print("FATAL: Invalid Discord token. Check your DISCORD_TOKEN env var.", flush=True)
+        sys.exit(1)
+    except Exception as e:
+        print(f"FATAL: Unexpected error: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
 asyncio.run(main())
