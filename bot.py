@@ -265,19 +265,20 @@ def extract_fled_name(message: discord.Message) -> str | None:
 
 def extract_catch_name(message: discord.Message) -> str | None:
     """
-    Grab the Pokémon name from Poketwo's catch message.
-    Handles: 'You caught a Level 31 Popplio ♂ (45.70%)!'
-    Also handles alt-language names like Hitokage, ヒノアラシ, etc.
+    Grab only the Pokémon name from Poketwo catch message.
+    Handles: 'You caught a Level 31 Brionne ♂ (67.20%)!'
+    Strips gender, IVs, level — returns just 'Brionne'.
     """
     texts = [message.content or ""] + [e.description or "" for e in message.embeds]
     for text in texts:
-        # Match everything after "a/an [Level N]" and stop at gender/IV symbols
         match = re.search(
-            r"[Yy]ou caught (?:a|an) (?:[Ll]evel \d+ )?(.+?)(?:\s*[♂♀✨]|\s*\(|\s*!)",
+            r"[Yy]ou caught (?:a|an) (?:[Ll]evel \d+ )?([A-Za-z][A-Za-z0-9\-]*(?:\s[A-Za-z][A-Za-z0-9\-]*)?)",
             text,
         )
         if match:
             name = match.group(1).strip()
+            # Extra safety: strip anything after colon or space+symbol
+            name = re.split(r"[:\s]*[♂♀✨\(]", name)[0].strip()
             if name:
                 print(f"==> Catch detected: '{name}'", flush=True)
                 return name
