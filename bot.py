@@ -18,11 +18,12 @@ if not TOKEN:
     print("FATAL: DISCORD_TOKEN not set!", flush=True)
     sys.exit(1)
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO  = "able0089/Namer"
-DB_FILE_PATH = "learned.json"
-HASH_SIZE    = 16
-MAX_POKEMON  = 1025
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO    = "able0089/Namer"
+DB_FILE_PATH   = "learned.json"
+HASH_SIZE      = 16
+MAX_POKEMON    = 1025
+POKETWO_BOT_ID = 716390085896962058  # only respond to official Poketwo
 
 _raw = os.environ.get("WATCH_CHANNEL_IDS", "")
 WATCH_CHANNEL_IDS: set[int] = {int(x) for x in _raw.split(",") if x.strip()}
@@ -33,10 +34,10 @@ print("==> Config loaded.", flush=True)
 intents = discord.Intents.default()
 intents.message_content = True
 
-learned_cache: dict[str, str] = {}
+learned_cache: dict[str, str]                       = {}
 last_spawn:    dict[int, tuple[str, discord.Message]] = {}
-sprite_db:     dict[str, list[int]] = {}
-github_sha:    str | None = None
+sprite_db:     dict[str, list[int]]                 = {}
+github_sha:    str | None                           = None
 
 
 # ── GITHUB PERSISTENCE ────────────────────────────────────────────────────────
@@ -44,7 +45,7 @@ github_sha:    str | None = None
 def gh_headers():
     return {
         "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
+        "Accept": "application/vnd.github.v3+json",
     }
 
 async def load_from_github(session: aiohttp.ClientSession):
@@ -59,8 +60,8 @@ async def load_from_github(session: aiohttp.ClientSession):
                 print("==> learned.json not in repo yet — starting fresh.", flush=True)
                 return
             data = await resp.json()
-            github_sha = data["sha"]
-            content = base64.b64decode(data["content"]).decode("utf-8")
+            github_sha    = data["sha"]
+            content       = base64.b64decode(data["content"]).decode("utf-8")
             learned_cache = json.loads(content)
             print(f"==> Loaded {len(learned_cache)} Pokémon from GitHub.", flush=True)
     except Exception as e:
@@ -70,9 +71,12 @@ async def save_to_github(session: aiohttp.ClientSession):
     global github_sha
     if not GITHUB_TOKEN:
         return
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_FILE_PATH}"
+    url         = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_FILE_PATH}"
     content_b64 = base64.b64encode(json.dumps(learned_cache, indent=2).encode()).decode()
-    payload: dict = {"message": f"bot: {len(learned_cache)} pokemon learned", "content": content_b64}
+    payload: dict = {
+        "message": f"bot: {len(learned_cache)} pokemon learned",
+        "content": content_b64,
+    }
     if github_sha:
         payload["sha"] = github_sha
     try:
@@ -88,70 +92,57 @@ async def save_to_github(session: aiohttp.ClientSession):
 
 # ── ENGLISH NAME RESOLVER ─────────────────────────────────────────────────────
 
-async def resolve_english_name(raw_name: str, session: aiohttp.ClientSession) -> str:
-    """
-    Convert ANY Pokémon name (any language) to its English name.
-    e.g. Hitokage → Charmander, Glumanda → Charmander, ヒノアラシ → Cyndaquil
-    """
-    slug = raw_name.strip().lower().replace(" ", "-")
-
-    # Step 1: Try direct PokéAPI lookup (works for English + slugs instantly)
+async def resolve_english_name(raw: str, session: aiohttp.ClientSession) -> str:
+    slug = raw.strip().lower().replace(" ", "-")
+    # Direct lookup (works for English names instantly)
     try:
         async with session.get(
             f"https://pokeapi.co/api/v2/pokemon/{slug}",
-            timeout=aiohttp.ClientTimeout(total=5)
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             if resp.status == 200:
-                data = await resp.json()
-                # Get species URL to find English name
+                data        = await resp.json()
                 species_url = data["species"]["url"]
-                async with session.get(species_url, timeout=aiohttp.ClientTimeout(total=5)) as sresp:
-                    if sresp.status == 200:
-                        sdata = await sresp.json()
-                        for entry in sdata["names"]:
+                async with session.get(species_url, timeout=aiohttp.ClientTimeout(total=5)) as sr:
+                    if sr.status == 200:
+                        for entry in (await sr.json())["names"]:
                             if entry["language"]["name"] == "en":
                                 return entry["name"]
                 return data["name"].capitalize()
     except Exception:
         pass
-
-    # Step 2: Search all species names across all languages
+    # Fallback: search all species across languages
     try:
         async with session.get(
             "https://pokeapi.co/api/v2/pokemon-species?limit=1025",
-            timeout=aiohttp.ClientTimeout(total=10)
+            timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             if resp.status == 200:
                 for species in (await resp.json())["results"]:
-                    async with session.get(species["url"], timeout=aiohttp.ClientTimeout(total=5)) as sresp:
-                        if sresp.status != 200:
+                    async with session.get(species["url"], timeout=aiohttp.ClientTimeout(total=5)) as sr:
+                        if sr.status != 200:
                             continue
-                        sdata = await sresp.json()
+                        sdata = await sr.json()
                         for entry in sdata["names"]:
-                            if entry["name"].lower() == raw_name.strip().lower():
+                            if entry["name"].lower() == raw.strip().lower():
                                 for en in sdata["names"]:
                                     if en["language"]["name"] == "en":
                                         return en["name"]
     except Exception:
         pass
-
-    return raw_name.strip().capitalize()  # fallback
+    return raw.strip().capitalize()
 
 
 # ── TEACH ─────────────────────────────────────────────────────────────────────
 
 async def teach(hash_str: str, raw_name: str, source: str, session: aiohttp.ClientSession) -> str:
-    """Resolve to English, save to cache and GitHub. Returns the final English name."""
     if not hash_str or not raw_name.strip():
         return raw_name
-
     english = await resolve_english_name(raw_name, session)
     if english.lower() != raw_name.strip().lower():
         print(f"==> Resolved '{raw_name}' → '{english}'", flush=True)
-
     if learned_cache.get(hash_str) == english:
-        return english  # already known
-
+        return english
     learned_cache[hash_str] = english
     print(f"==> Learned: {english} (via {source}) — {len(learned_cache)} total", flush=True)
     await save_to_github(session)
@@ -162,11 +153,11 @@ async def teach(hash_str: str, raw_name: str, source: str, session: aiohttp.Clie
 
 def phash(img: Image.Image) -> list[int]:
     img = img.convert("RGBA")
-    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    bg  = Image.new("RGBA", img.size, (255, 255, 255, 255))
     bg.paste(img, mask=img.split()[3])
-    img = bg.convert("L").resize((HASH_SIZE, HASH_SIZE), Image.LANCZOS)
+    img    = bg.convert("L").resize((HASH_SIZE, HASH_SIZE), Image.LANCZOS)
     pixels = list(img.getdata())
-    avg = sum(pixels) / len(pixels)
+    avg    = sum(pixels) / len(pixels)
     return [1 if p > avg else 0 for p in pixels]
 
 def hash_to_str(h: list[int]) -> str:
@@ -181,7 +172,7 @@ async def get_image_hash(image_url: str, session: aiohttp.ClientSession):
             if resp.status != 200:
                 return None, None
             img = Image.open(io.BytesIO(await resp.read()))
-            h = phash(img)
+            h   = phash(img)
             return h, hash_to_str(h)
     except Exception as e:
         print(f"==> Image fetch error: {e}", flush=True)
@@ -196,7 +187,7 @@ async def build_sprite_db(session: aiohttp.ClientSession):
     try:
         async with session.get(
             f"https://pokeapi.co/api/v2/pokemon?limit={MAX_POKEMON}",
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             pokemon_list = (await resp.json())["results"]
     except Exception as e:
@@ -208,24 +199,27 @@ async def build_sprite_db(session: aiohttp.ClientSession):
     for entry in pokemon_list:
         name   = entry["name"]
         dex_id = entry["url"].rstrip("/").split("/")[-1]
-        url    = f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/home/{dex_id}.png"
+        url    = (
+            "https://raw.githubusercontent.com/PokeAPI/sprites/master"
+            f"/sprites/pokemon/other/home/{dex_id}.png"
+        )
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     continue
-                img = Image.open(io.BytesIO(await resp.read()))
+                img            = Image.open(io.BytesIO(await resp.read()))
                 sprite_db[name] = phash(img)
-                success += 1
+                success        += 1
         except Exception:
             pass
         if success % 100 == 0 and success > 0:
             print(f"==> {success} sprites loaded…", flush=True)
             await asyncio.sleep(0.3)
-    print(f"==> ✅ Sprite DB ready! {success} Pokémon loaded.", flush=True)
+    print(f"==> Sprite DB ready! {success} Pokémon loaded.", flush=True)
 
 def guess_from_sprites(spawn_hash: list[int]) -> tuple[str | None, float]:
     if not sprite_db:
-        return None, 0
+        return None, 0.0
     best_name, best_dist = None, math.inf
     for name, h in sprite_db.items():
         d = hamming(spawn_hash, h)
@@ -247,7 +241,8 @@ def get_spawn_image_url(message: discord.Message) -> str | None:
     return None
 
 def is_spawn_message(message: discord.Message) -> bool:
-    if not message.author.bot:
+    # Only respond to the official Poketwo bot
+    if message.author.id != POKETWO_BOT_ID:
         return False
     for embed in message.embeds:
         title = (embed.title or "").lower()
@@ -258,8 +253,10 @@ def is_spawn_message(message: discord.Message) -> bool:
             return True
     return False
 
+def is_poketwo_message(message: discord.Message) -> bool:
+    return message.author.id == POKETWO_BOT_ID
+
 def extract_fled_name(message: discord.Message) -> str | None:
-    """Extract name from 'Wild Shroomish fled.' in embed title."""
     for embed in message.embeds:
         match = re.search(r"Wild (.+?) fled", embed.title or "", re.IGNORECASE)
         if match:
@@ -268,23 +265,21 @@ def extract_fled_name(message: discord.Message) -> str | None:
 
 def extract_catch_name(message: discord.Message) -> str | None:
     """
-    Extract Pokémon name from catch message.
+    Grab the Pokémon name from Poketwo's catch message.
     Handles: 'You caught a Level 31 Popplio ♂ (45.70%)!'
-    Stops at first non-letter character after the name.
-    Works for any language name.
+    Also handles alt-language names like Hitokage, ヒノアラシ, etc.
     """
-    # Check plain content first
-    for text in [message.content] + [e.description or "" for e in message.embeds]:
-        # Match: "caught a/an [Level N] <NAME>" — stop at space+symbol or end
+    texts = [message.content or ""] + [e.description or "" for e in message.embeds]
+    for text in texts:
+        # Match everything after "a/an [Level N]" and stop at gender/IV symbols
         match = re.search(
-            r"[Yy]ou caught (?:a|an) (?:[Ll]evel \d+ )?([^\s!♂♀✨\n]+)",
-            text
+            r"[Yy]ou caught (?:a|an) (?:[Ll]evel \d+ )?(.+?)(?:\s*[♂♀✨]|\s*\(|\s*!)",
+            text,
         )
         if match:
             name = match.group(1).strip()
-            # Strip any trailing punctuation
-            name = re.sub(r"[^A-Za-z\-\u0000-\uFFFF]+$", "", name).strip()
             if name:
+                print(f"==> Catch detected: '{name}'", flush=True)
                 return name
     return None
 
@@ -292,7 +287,7 @@ def extract_catch_name(message: discord.Message) -> str | None:
 # ── DISCORD BOT ───────────────────────────────────────────────────────────────
 
 async def run_bot():
-    delay = 10
+    delay   = 10
     attempt = 0
 
     while True:
@@ -312,7 +307,7 @@ async def run_bot():
 
             # ── SPAWN ─────────────────────────────────────────────────────────
             if is_spawn_message(message):
-                print(f"==> Spawn in #{message.channel} from {message.author}", flush=True)
+                print(f"==> Spawn in #{message.channel}", flush=True)
 
                 # Learn previous Pokémon from fled text in new spawn title
                 fled_name = extract_fled_name(message)
@@ -338,31 +333,36 @@ async def run_bot():
 
                 if hash_str in learned_cache:
                     name = learned_cache[hash_str]
-                    print(f"==> Known: {name}", flush=True)
+                    # Still compute confidence for display
+                    _, confidence = guess_from_sprites(spawn_hash)
+                    print(f"==> Known: {name} ({confidence}%)", flush=True)
                     bot_msg = await message.channel.send(
-                        f"🔍 That's **{name}**!",
-                        reference=message, mention_author=False,
+                        f"🔍 That's **{name}**! *({confidence}% confidence)*",
+                        reference=message,
+                        mention_author=False,
                     )
                 else:
                     guess, confidence = guess_from_sprites(spawn_hash)
                     if guess and confidence >= 55:
                         print(f"==> Guessing: {guess} ({confidence}%)", flush=True)
                         bot_msg = await message.channel.send(
-                            f"🔍 That's **{guess.capitalize()}**! *(learning...)*",
-                            reference=message, mention_author=False,
+                            f"🔍 That's **{guess.capitalize()}**! *({confidence}% confidence, learning...)*",
+                            reference=message,
+                            mention_author=False,
                         )
                     else:
                         print("==> Unknown, waiting to learn…", flush=True)
                         bot_msg = await message.channel.send(
                             f"❓ Unknown Pokémon! *(I'll learn when caught/fled)*",
-                            reference=message, mention_author=False,
+                            reference=message,
+                            mention_author=False,
                         )
 
                 last_spawn[channel_id] = (hash_str, bot_msg)
                 return
 
-            # ── CATCH / BOT MESSAGES ──────────────────────────────────────────
-            if message.author.bot:
+            # ── CATCH / POKETWO MESSAGES ──────────────────────────────────────
+            if is_poketwo_message(message):
                 catch_name = extract_catch_name(message)
                 if catch_name and channel_id in last_spawn:
                     prev_hash_str, prev_bot_msg = last_spawn[channel_id]
@@ -397,19 +397,22 @@ async def run_bot():
 
                 if hash_str in learned_cache:
                     name = learned_cache[hash_str]
-                    await message.channel.send(f"🔍 That's **{name}**! *(from memory)*")
+                    _, confidence = guess_from_sprites(spawn_hash)
+                    await message.channel.send(
+                        f"🔍 That's **{name}**! *({confidence}% confidence, from memory)*"
+                    )
                 else:
                     guess, confidence = guess_from_sprites(spawn_hash)
                     if guess:
                         bot_msg = await message.channel.send(
-                            f"🔍 Best guess: **{guess.capitalize()}** ({confidence}% confidence)"
+                            f"🔍 Best guess: **{guess.capitalize()}** *({confidence}% confidence)*"
                         )
                         last_spawn[channel_id] = (hash_str, bot_msg)
                     else:
                         await message.channel.send("🤔 No idea!")
                 return
 
-            # ── !correct Name — manually teach the bot ────────────────────────
+            # ── !correct Name ─────────────────────────────────────────────────
             if message.content.lower().startswith("!correct "):
                 raw_name = message.content[9:].strip()
                 if raw_name and channel_id in last_spawn:
@@ -417,7 +420,9 @@ async def run_bot():
                     async with aiohttp.ClientSession() as session:
                         english = await teach(prev_hash_str, raw_name, "manual", session)
                     try:
-                        await prev_bot_msg.edit(content=f"🔍 That's **{english}**! *(corrected)*")
+                        await prev_bot_msg.edit(
+                            content=f"🔍 That's **{english}**! *(corrected)*"
+                        )
                     except Exception:
                         pass
                     await message.add_reaction("✅")
