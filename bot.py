@@ -5,7 +5,6 @@ import sys
 import traceback
 import discord
 import aiohttp
-from aiohttp import web
 
 print("==> bot.py starting up", flush=True)
 
@@ -16,50 +15,74 @@ if not TOKEN:
     sys.exit(1)
 
 POKETWO_BOT_ID = 716390085896962058
-PORT = int(os.environ.get("PORT", 8080))
 _raw = os.environ.get("WATCH_CHANNEL_IDS", "")
 WATCH_CHANNEL_IDS: set[int] = {int(x) for x in _raw.split(",") if x.strip()}
 
-print(f"==> Config loaded. PORT={PORT}", flush=True)
+print("==> Config loaded.", flush=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 
-# ── KEEP-ALIVE WEB SERVER ─────────────────────────────────────────────────────
+# ── POKEMON IDENTIFICATION ────────────────────────────────────────────────────
 
-async def handle_health(request):
-    return web.Response(text="Bot is running ✅")
+async def identify_pokemon(message: discord.Message, session: aiohttp.ClientSession) -> str | None:
+    """
+    Try multiple strategies to identify the Pokémon from a Poketwo spawn embed.
+    Returns the Pokémon name or None if unidentified.
+    """
 
-async def start_webserver():
-    app = web.Application()
-    app.router.add_get("/", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"==> Web server listening on port {PORT}", flush=True)
+    for embed in message.embeds:
+        # ── Strategy 1: dex number from image URL ────────────────────────────
+        image_url = (embed.image and embed.image.url) or (embed.thumbnail and embed.thumbnail.url) or ""
+        print(f"==> Image URL: {image_url}", flush=True)
 
+        match = re.search(r"/(\d+)\.(?:png|gif|jpg|webp)", image_url)
+        if match:
+            dex = match.group(1)
+            print(f"==> Found dex number: {dex}", flush=True)
+            name = await pokeapi_lookup(dex, session)
+            if name:
+                return name
 
-# ── POKEMON HELPERS ───────────────────────────────────────────────────────────
+        # ── Strategy 2: name slug from image URL ─────────────────────────────
+        match = re.search(r"/([a-z][a-z0-9\-]+)\.(?:png|gif|jpg|webp)", image_url)
+        if match:
+            slug = match.group(1)
+            # filter out common non-pokemon path segments
+            if slug not in ("images", "sprites", "pokemon", "static", "assets"):
+                print(f"==> Found slug: {slug}", flush=True)
+                name = await pokeapi_lookup(slug, session)
+                if name:
+                    return name
 
-def extract_pokemon_name_from_url(url: str) -> str | None:
-    match = re.search(r"/(\d+)\.(?:png|gif|jpg|webp)(?:\?|$)", url)
-    if match:
-        return match.group(1)
-    match = re.search(r"/([a-z][a-z0-9\-]+)\.(?:png|gif|jpg|webp)(?:\?|$)", url)
-    if match:
-        return match.group(1)
+        # ── Strategy 3: look for hidden Pokémon name in embed footer/fields ──
+        footer_text = (embed.footer and embed.footer.text) or ""
+        for field in embed.fields:
+            text = f"{field.name} {field.value}"
+            slug_match = re.search(r"\b([A-Z][a-z]+(?:[- ][A-Z][a-z]+)*)\b", text)
+            if slug_match:
+                candidate = slug_match.group(1).lower().replace(" ", "-")
+                name = await pokeapi_lookup(candidate, session)
+                if name:
+                    return name
+
     return None
 
-async def resolve_pokemon(identifier: str, session: aiohttp.ClientSession) -> str:
+
+async def pokeapi_lookup(identifier: str, session: aiohttp.ClientSession) -> str | None:
+    """Look up a Pokémon by dex number or name slug. Returns proper name or None."""
     url = f"https://pokeapi.co/api/v2/pokemon/{identifier.lower()}"
-    async with session.get(url) as resp:
-        if resp.status == 200:
-            data = await resp.json()
-            return data["name"].capitalize()
-    return identifier.capitalize()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data["name"].capitalize()
+    except Exception as e:
+        print(f"==> PokéAPI error for '{identifier}': {e}", flush=True)
+    return None
+
 
 def is_spawn_message(message: discord.Message) -> bool:
     if message.author.id != POKETWO_BOT_ID:
@@ -69,14 +92,18 @@ def is_spawn_message(message: discord.Message) -> bool:
         desc  = (embed.description or "").lower()
         if "wild pokémon" in title or "wild pokémon" in desc:
             return True
+        # also catch "A wild pokémon has appeared!" style
+        if "wild" in title and "pokémon" in title:
+            return True
+        if "wild" in desc and "pokémon" in desc:
+            return True
     return False
 
 
 # ── DISCORD BOT ───────────────────────────────────────────────────────────────
 
 async def run_bot():
-    """Create a fresh client and connect. Retries on rate limit."""
-    delay = 10  # seconds between retries
+    delay = 10
     attempt = 0
 
     while True:
@@ -95,59 +122,52 @@ async def run_bot():
             if not is_spawn_message(message):
                 return
 
-            image_urls: list[str] = []
-            for embed in message.embeds:
-                if embed.image and embed.image.url:
-                    image_urls.append(embed.image.url)
-                if embed.thumbnail and embed.thumbnail.url:
-                    image_urls.append(embed.thumbnail.url)
+            print(f"==> Spawn detected in #{message.channel}", flush=True)
 
-            if not image_urls:
-                return
+            # Log all embed image URLs to help debug
+            for embed in message.embeds:
+                print(f"==> Embed title: {embed.title}", flush=True)
+                print(f"==> Embed image: {embed.image and embed.image.url}", flush=True)
+                print(f"==> Embed thumbnail: {embed.thumbnail and embed.thumbnail.url}", flush=True)
 
             async with aiohttp.ClientSession() as session:
-                for url in image_urls:
-                    identifier = extract_pokemon_name_from_url(url)
-                    if identifier:
-                        name = await resolve_pokemon(identifier, session)
-                        await message.channel.send(
-                            f"🔍 That's **{name}**!",
-                            reference=message,
-                            mention_author=False,
-                        )
-                        return
+                name = await identify_pokemon(message, session)
 
-            await message.channel.send(
-                "🤔 I spotted a spawn but couldn't identify the Pokémon.",
-                reference=message,
-                mention_author=False,
-            )
+            if name:
+                await message.channel.send(
+                    f"🔍 That's **{name}**!",
+                    reference=message,
+                    mention_author=False,
+                )
+            else:
+                await message.channel.send(
+                    "🤔 I spotted a spawn but couldn't identify the Pokémon.",
+                    reference=message,
+                    mention_author=False,
+                )
 
         try:
             print(f"==> Attempt {attempt}: Connecting to Discord…", flush=True)
             await client.start(TOKEN)
-            # If client.start() returns normally (e.g. logout), restart
-            print("==> Bot disconnected cleanly. Reconnecting in 30 s…", flush=True)
+            print("==> Bot disconnected. Reconnecting in 30 s…", flush=True)
             await asyncio.sleep(30)
 
         except discord.LoginFailure:
-            print("FATAL: Invalid token. Regenerate it in the Discord Developer Portal.", flush=True)
-            sys.exit(1)  # No point retrying — token is wrong
+            print("FATAL: Invalid token.", flush=True)
+            sys.exit(1)
 
         except Exception as e:
             print(f"==> Connection failed (attempt {attempt}): {e}", flush=True)
-            traceback.print_exc()
             print(f"==> Retrying in {delay} s…", flush=True)
             await asyncio.sleep(delay)
-            delay = min(delay * 2, 120)  # exponential backoff, cap at 2 min
+            delay = min(delay * 2, 120)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    await start_webserver()
-    print("==> Waiting 10 s before first Discord login attempt…", flush=True)
-    await asyncio.sleep(10)
-    await run_bot()  # loops forever, retrying on failure
+    print("==> Waiting 5 s before Discord login…", flush=True)
+    await asyncio.sleep(5)
+    await run_bot()
 
 asyncio.run(main())
