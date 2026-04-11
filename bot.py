@@ -3,11 +3,12 @@ import os
 import sys
 import io
 import re
+import json
 import math
+import base64
 import discord
 import aiohttp
 from PIL import Image
-from motor.motor_asyncio import AsyncIOMotorClient
 
 print("==> bot.py starting up", flush=True)
 
@@ -17,15 +18,14 @@ if not TOKEN:
     print("FATAL: DISCORD_TOKEN not set!", flush=True)
     sys.exit(1)
 
-MONGO_URI = os.environ.get("MONGO_URI")
-if not MONGO_URI:
-    print("FATAL: MONGO_URI not set!", flush=True)
-    sys.exit(1)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO  = "able0089/Namer"
+DB_FILE_PATH = "learned.json"
 
-POKETWO_BOT_ID = 716390085896962058
+POKETWO_BOT_ID = 716390085896962056
 _raw = os.environ.get("WATCH_CHANNEL_IDS", "")
 WATCH_CHANNEL_IDS: set[int] = {int(x) for x in _raw.split(",") if x.strip()}
-HASH_SIZE = 16
+HASH_SIZE   = 16
 MAX_POKEMON = 1025
 
 print("==> Config loaded.", flush=True)
@@ -34,40 +34,74 @@ print("==> Config loaded.", flush=True)
 intents = discord.Intents.default()
 intents.message_content = True
 
-# MongoDB
-mongo_client = AsyncIOMotorClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
-db = mongo_client["pokebot"]
-collection = db["learned"]
-
-# In-memory cache (so we don't query MongoDB on every spawn)
 learned_cache: dict[str, str] = {}
-
-# {channel_id: (hash_str, bot_message)}
-last_spawn: dict[int, tuple[str, discord.Message]] = {}
-
-# {name: phash} — HOME sprites for fallback
-sprite_db: dict[str, list[int]] = {}
+last_spawn:    dict[int, tuple[str, discord.Message]] = {}
+sprite_db:     dict[str, list[int]] = {}
+github_sha:    str | None = None
 
 
-# ── MONGODB HELPERS ───────────────────────────────────────────────────────────
+# ── GITHUB PERSISTENCE ────────────────────────────────────────────────────────
 
-async def load_learned():
-    global learned_cache
-    async for doc in collection.find():
-        learned_cache[doc["hash"]] = doc["name"]
-    print(f"==> Loaded {len(learned_cache)} Pokémon from MongoDB.", flush=True)
+def gh_headers():
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
 
-async def teach(hash_str: str, name: str, source: str):
+async def load_from_github(session: aiohttp.ClientSession):
+    global learned_cache, github_sha
+    if not GITHUB_TOKEN:
+        print("==> No GITHUB_TOKEN — learned data won't persist.", flush=True)
+        return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_FILE_PATH}"
+    try:
+        async with session.get(url, headers=gh_headers()) as resp:
+            if resp.status == 404:
+                print("==> learned.json not in repo yet — starting fresh.", flush=True)
+                return
+            data = await resp.json()
+            github_sha = data["sha"]
+            content = base64.b64decode(data["content"]).decode("utf-8")
+            learned_cache = json.loads(content)
+            print(f"==> Loaded {len(learned_cache)} Pokémon from GitHub.", flush=True)
+    except Exception as e:
+        print(f"==> GitHub load error: {e}", flush=True)
+
+async def save_to_github(session: aiohttp.ClientSession):
+    global github_sha
+    if not GITHUB_TOKEN:
+        return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{DB_FILE_PATH}"
+    content_b64 = base64.b64encode(
+        json.dumps(learned_cache, indent=2).encode()
+    ).decode()
+    payload: dict = {
+        "message": f"bot: learned {len(learned_cache)} pokemon",
+        "content": content_b64,
+    }
+    if github_sha:
+        payload["sha"] = github_sha
+    try:
+        async with session.put(url, headers=gh_headers(), json=payload) as resp:
+            if resp.status in (200, 201):
+                data = await resp.json()
+                github_sha = data["content"]["sha"]
+                print(f"==> Saved to GitHub! Total: {len(learned_cache)} Pokémon.", flush=True)
+            else:
+                text = await resp.text()
+                print(f"==> GitHub save failed {resp.status}: {text}", flush=True)
+    except Exception as e:
+        print(f"==> GitHub save error: {e}", flush=True)
+
+async def teach(hash_str: str, name: str, source: str, session: aiohttp.ClientSession):
     name = name.strip().capitalize()
     if not hash_str or not name:
         return
+    if learned_cache.get(hash_str) == name:
+        return  # already known, skip
     learned_cache[hash_str] = name
-    await collection.update_one(
-        {"hash": hash_str},
-        {"$set": {"name": name}},
-        upsert=True
-    )
-    print(f"==> Learned: {name} (via {source}) — DB now has {len(learned_cache)} Pokémon", flush=True)
+    print(f"==> Learned: {name} (via {source}) — {len(learned_cache)} total", flush=True)
+    await save_to_github(session)
 
 
 # ── IMAGE HASHING ─────────────────────────────────────────────────────────────
@@ -101,15 +135,15 @@ async def build_sprite_db(session: aiohttp.ClientSession):
             data = await resp.json()
             pokemon_list = data["results"]
     except Exception as e:
-        print(f"==> Failed to fetch list: {e}", flush=True)
+        print(f"==> Failed: {e}", flush=True)
         return
 
-    print(f"==> Downloading HOME sprites…", flush=True)
+    print("==> Downloading HOME sprites…", flush=True)
     success = 0
     for entry in pokemon_list:
-        name = entry["name"]
+        name   = entry["name"]
         dex_id = entry["url"].rstrip("/").split("/")[-1]
-        url = f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/home/{dex_id}.png"
+        url    = f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/home/{dex_id}.png"
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
@@ -122,7 +156,6 @@ async def build_sprite_db(session: aiohttp.ClientSession):
         if success % 100 == 0 and success > 0:
             print(f"==> {success} sprites loaded…", flush=True)
             await asyncio.sleep(0.3)
-
     print(f"==> ✅ Sprite DB ready! {success} Pokémon loaded.", flush=True)
 
 def guess_from_sprites(spawn_hash: list[int]) -> tuple[str | None, float]:
@@ -169,13 +202,13 @@ def extract_fled_name(message: discord.Message) -> str | None:
 
 def extract_catch_name(message: discord.Message) -> str | None:
     content = message.content or ""
-    match = re.search(r"[Yy]ou caught (a|an) (?:level \d+ )?(.+?)!", content)
+    match = re.search(r"[Yy]ou caught (?:a|an) (?:level \d+ )?(.+?)!", content)
     if match:
-        return match.group(2).strip()
+        return match.group(1).strip()
     for embed in message.embeds:
-        match = re.search(r"[Yy]ou caught (a|an) (?:level \d+ )?(.+?)!", embed.description or "")
+        match = re.search(r"[Yy]ou caught (?:a|an) (?:level \d+ )?(.+?)!", embed.description or "")
         if match:
-            return match.group(2).strip()
+            return match.group(1).strip()
     return None
 
 async def get_image_hash(image_url: str, session: aiohttp.ClientSession):
@@ -204,12 +237,11 @@ async def run_bot():
         @client.event
         async def on_ready():
             print(f"==> Logged in as {client.user} (ID: {client.user.id})", flush=True)
-            print(f"==> Ready! MongoDB has {len(learned_cache)} Pokémon.", flush=True)
+            print(f"==> Ready! Learned DB has {len(learned_cache)} Pokémon.", flush=True)
 
         @client.event
         async def on_message(message: discord.Message):
             channel_id = message.channel.id
-
             if WATCH_CHANNEL_IDS and channel_id not in WATCH_CHANNEL_IDS:
                 return
 
@@ -221,7 +253,8 @@ async def run_bot():
                 fled_name = extract_fled_name(message)
                 if fled_name and channel_id in last_spawn:
                     prev_hash_str, prev_bot_msg = last_spawn[channel_id]
-                    await teach(prev_hash_str, fled_name, "fled")
+                    async with aiohttp.ClientSession() as session:
+                        await teach(prev_hash_str, fled_name, "fled", session)
                     try:
                         await prev_bot_msg.edit(content=f"🔍 That was **{fled_name.capitalize()}**!")
                     except Exception:
@@ -237,7 +270,7 @@ async def run_bot():
                 if spawn_hash is None:
                     return
 
-                # Check MongoDB cache first
+                # Check learned DB first
                 if hash_str in learned_cache:
                     name = learned_cache[hash_str]
                     print(f"==> Known: {name}", flush=True)
@@ -247,7 +280,6 @@ async def run_bot():
                         mention_author=False,
                     )
                 else:
-                    # Fallback sprite guess
                     guess, confidence = guess_from_sprites(spawn_hash)
                     if guess and confidence >= 55:
                         print(f"==> Guessing: {guess} ({confidence}%)", flush=True)
@@ -258,7 +290,7 @@ async def run_bot():
                         )
                     else:
                         bot_msg = await message.channel.send(
-                            f"❓ Unknown Pokémon! *(learning when caught/fled)*",
+                            f"❓ Unknown Pokémon! *(I'll learn when caught/fled)*",
                             reference=message,
                             mention_author=False,
                         )
@@ -271,7 +303,8 @@ async def run_bot():
                 catch_name = extract_catch_name(message)
                 if catch_name and channel_id in last_spawn:
                     prev_hash_str, prev_bot_msg = last_spawn[channel_id]
-                    await teach(prev_hash_str, catch_name, "catch")
+                    async with aiohttp.ClientSession() as session:
+                        await teach(prev_hash_str, catch_name, "catch", session)
                     try:
                         await prev_bot_msg.edit(content=f"🔍 That was **{catch_name.capitalize()}**!")
                     except Exception:
@@ -279,12 +312,13 @@ async def run_bot():
                     last_spawn.pop(channel_id, None)
                 return
 
-            # ── MANUAL CORRECTION: !correct Name ─────────────────────────────
+            # ── MANUAL CORRECTION ─────────────────────────────────────────────
             if message.content.lower().startswith("!correct "):
                 name = message.content[9:].strip()
                 if name and channel_id in last_spawn:
                     prev_hash_str, prev_bot_msg = last_spawn[channel_id]
-                    await teach(prev_hash_str, name, "manual")
+                    async with aiohttp.ClientSession() as session:
+                        await teach(prev_hash_str, name, "manual", session)
                     try:
                         await prev_bot_msg.edit(content=f"🔍 That's **{name.capitalize()}**! *(corrected)*")
                     except Exception:
@@ -313,10 +347,10 @@ async def run_bot():
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    await load_learned()
     print("==> Waiting 5 s…", flush=True)
     await asyncio.sleep(5)
     async with aiohttp.ClientSession() as session:
+        await load_from_github(session)
         await build_sprite_db(session)
     await run_bot()
 
