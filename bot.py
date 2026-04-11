@@ -313,6 +313,9 @@ async def run_bot():
 
         @client.event
         async def on_message(message: discord.Message):
+            asyncio.create_task(handle_message(message))
+
+        async def handle_message(message: discord.Message):
             channel_id = message.channel.id
             if WATCH_CHANNEL_IDS and channel_id not in WATCH_CHANNEL_IDS:
                 return
@@ -328,7 +331,7 @@ async def run_bot():
                     async with aiohttp.ClientSession() as session:
                         english = await teach(prev_hash_str, fled_name, "fled", session)
                     try:
-                        await prev_bot_msg.edit(content=f"🔍 That was **{english}**!")
+                        await message.channel.send(f"✅ Learned: **{english}**!")
                     except Exception:
                         pass
 
@@ -381,7 +384,7 @@ async def run_bot():
                     async with aiohttp.ClientSession() as session:
                         english = await teach(prev_hash_str, catch_name, "catch", session)
                     try:
-                        await prev_bot_msg.edit(content=f"🔍 That was **{english}**!")
+                        await message.channel.send(f"✅ Learned: **{english}**!")
                     except Exception:
                         pass
                     last_spawn.pop(channel_id, None)
@@ -432,9 +435,7 @@ async def run_bot():
                     async with aiohttp.ClientSession() as session:
                         english = await teach(prev_hash_str, raw_name, "manual", session)
                     try:
-                        await prev_bot_msg.edit(
-                            content=f"🔍 That's **{english}**! *(corrected)*"
-                        )
+                        await message.channel.send(f"✅ Learned: **{english}**! *(corrected)*")
                     except Exception:
                         pass
                     await message.add_reaction("✅")
