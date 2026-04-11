@@ -141,9 +141,20 @@ async def teach(hash_str: str, raw_name: str, source: str, session: aiohttp.Clie
     english = await resolve_english_name(raw_name, session)
     if english.lower() != raw_name.strip().lower():
         print(f"==> Resolved '{raw_name}' → '{english}'", flush=True)
-    if learned_cache.get(hash_str) == english:
-        return english
-    learned_cache[hash_str] = english
+
+    # Find this Pokemon's HOME sprite hash from sprite_db and save THAT
+    # This way every future spawn of this Pokemon matches the clean sprite
+    sprite_key = english.lower().replace(" ", "-")
+    if sprite_key in sprite_db:
+        home_hash_str = hash_to_str(sprite_db[sprite_key])
+        if learned_cache.get(home_hash_str) != english:
+            learned_cache[home_hash_str] = english
+            print(f"==> Saved HOME sprite hash for {english}", flush=True)
+
+    # Also save the original spawn hash as a bonus mapping
+    if learned_cache.get(hash_str) != english:
+        learned_cache[hash_str] = english
+
     print(f"==> Learned: {english} (via {source}) — {len(learned_cache)} total", flush=True)
     await save_to_github(session)
     return english
