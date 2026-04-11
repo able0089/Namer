@@ -1,5 +1,4 @@
 import asyncio
-import re
 import os
 import sys
 import base64
@@ -11,12 +10,12 @@ print("==> bot.py starting up", flush=True)
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
-    print("FATAL: DISCORD_TOKEN environment variable is not set!", flush=True)
+    print("FATAL: DISCORD_TOKEN not set!", flush=True)
     sys.exit(1)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    print("FATAL: ANTHROPIC_API_KEY environment variable is not set!", flush=True)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("FATAL: GEMINI_API_KEY not set!", flush=True)
     sys.exit(1)
 
 POKETWO_BOT_ID = 716390085896962058
@@ -29,13 +28,16 @@ print("==> Config loaded.", flush=True)
 intents = discord.Intents.default()
 intents.message_content = True
 
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent?key={key}"
+)
+
 
 # ── AI IMAGE IDENTIFICATION ───────────────────────────────────────────────────
 
 async def identify_pokemon_from_image(image_url: str, session: aiohttp.ClientSession) -> str | None:
-    """Download the spawn image and ask Claude to identify the Pokémon."""
-
-    # Download image
+    # Download the spawn image
     try:
         async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
@@ -49,56 +51,44 @@ async def identify_pokemon_from_image(image_url: str, session: aiohttp.ClientSes
 
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
-    # Ask Claude to identify it
     payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 64,
-        "messages": [
+        "contents": [
             {
-                "role": "user",
-                "content": [
+                "parts": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": content_type,
+                        "inline_data": {
+                            "mime_type": content_type,
                             "data": image_b64,
-                        },
+                        }
                     },
                     {
-                        "type": "text",
                         "text": (
                             "This is a Pokémon from the game. "
                             "Reply with ONLY the Pokémon's English name, nothing else. "
                             "No punctuation, no explanation, just the name."
-                        ),
+                        )
                     },
-                ],
+                ]
             }
-        ],
+        ]
     }
 
     try:
+        url = GEMINI_URL.format(key=GEMINI_API_KEY)
         async with session.post(
-            "https://api.anthropic.com/v1/messages",
+            url,
             json=payload,
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                print(f"==> Claude API error {resp.status}: {text}", flush=True)
-                return None
             data = await resp.json()
-            name = data["content"][0]["text"].strip()
-            print(f"==> Claude identified: {name}", flush=True)
+            if resp.status != 200:
+                print(f"==> Gemini API error {resp.status}: {data}", flush=True)
+                return None
+            name = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            print(f"==> Gemini identified: {name}", flush=True)
             return name
     except Exception as e:
-        print(f"==> Claude API request error: {e}", flush=True)
+        print(f"==> Gemini request error: {e}", flush=True)
         return None
 
 
@@ -147,10 +137,9 @@ async def run_bot():
                 return
 
             print(f"==> Spawn detected in #{message.channel}", flush=True)
-
             image_url = get_spawn_image_url(message)
             if not image_url:
-                print("==> No image found in embed.", flush=True)
+                print("==> No image found.", flush=True)
                 return
 
             print(f"==> Identifying image: {image_url}", flush=True)
