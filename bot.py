@@ -2,7 +2,7 @@ import asyncio
 import re
 import os
 import sys
-import traceback
+import base64
 import discord
 import aiohttp
 
@@ -12,6 +12,11 @@ print("==> bot.py starting up", flush=True)
 TOKEN = os.environ.get("DISCORD_TOKEN")
 if not TOKEN:
     print("FATAL: DISCORD_TOKEN environment variable is not set!", flush=True)
+    sys.exit(1)
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    print("FATAL: ANTHROPIC_API_KEY environment variable is not set!", flush=True)
     sys.exit(1)
 
 POKETWO_BOT_ID = 716390085896962058
@@ -25,62 +30,84 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 
-# ── POKEMON IDENTIFICATION ────────────────────────────────────────────────────
+# ── AI IMAGE IDENTIFICATION ───────────────────────────────────────────────────
 
-async def identify_pokemon(message: discord.Message, session: aiohttp.ClientSession) -> str | None:
-    """
-    Try multiple strategies to identify the Pokémon from a Poketwo spawn embed.
-    Returns the Pokémon name or None if unidentified.
-    """
+async def identify_pokemon_from_image(image_url: str, session: aiohttp.ClientSession) -> str | None:
+    """Download the spawn image and ask Claude to identify the Pokémon."""
 
-    for embed in message.embeds:
-        # ── Strategy 1: dex number from image URL ────────────────────────────
-        image_url = (embed.image and embed.image.url) or (embed.thumbnail and embed.thumbnail.url) or ""
-        print(f"==> Image URL: {image_url}", flush=True)
-
-        match = re.search(r"/(\d+)\.(?:png|gif|jpg|webp)", image_url)
-        if match:
-            dex = match.group(1)
-            print(f"==> Found dex number: {dex}", flush=True)
-            name = await pokeapi_lookup(dex, session)
-            if name:
-                return name
-
-        # ── Strategy 2: name slug from image URL ─────────────────────────────
-        match = re.search(r"/([a-z][a-z0-9\-]+)\.(?:png|gif|jpg|webp)", image_url)
-        if match:
-            slug = match.group(1)
-            # filter out common non-pokemon path segments
-            if slug not in ("images", "sprites", "pokemon", "static", "assets"):
-                print(f"==> Found slug: {slug}", flush=True)
-                name = await pokeapi_lookup(slug, session)
-                if name:
-                    return name
-
-        # ── Strategy 3: look for hidden Pokémon name in embed footer/fields ──
-        footer_text = (embed.footer and embed.footer.text) or ""
-        for field in embed.fields:
-            text = f"{field.name} {field.value}"
-            slug_match = re.search(r"\b([A-Z][a-z]+(?:[- ][A-Z][a-z]+)*)\b", text)
-            if slug_match:
-                candidate = slug_match.group(1).lower().replace(" ", "-")
-                name = await pokeapi_lookup(candidate, session)
-                if name:
-                    return name
-
-    return None
-
-
-async def pokeapi_lookup(identifier: str, session: aiohttp.ClientSession) -> str | None:
-    """Look up a Pokémon by dex number or name slug. Returns proper name or None."""
-    url = f"https://pokeapi.co/api/v2/pokemon/{identifier.lower()}"
+    # Download image
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data["name"].capitalize()
+        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                print(f"==> Failed to download image: {resp.status}", flush=True)
+                return None
+            image_bytes = await resp.read()
+            content_type = resp.content_type or "image/jpeg"
     except Exception as e:
-        print(f"==> PokéAPI error for '{identifier}': {e}", flush=True)
+        print(f"==> Image download error: {e}", flush=True)
+        return None
+
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    # Ask Claude to identify it
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": content_type,
+                            "data": image_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This is a Pokémon from the game. "
+                            "Reply with ONLY the Pokémon's English name, nothing else. "
+                            "No punctuation, no explanation, just the name."
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
+
+    try:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            json=payload,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"==> Claude API error {resp.status}: {text}", flush=True)
+                return None
+            data = await resp.json()
+            name = data["content"][0]["text"].strip()
+            print(f"==> Claude identified: {name}", flush=True)
+            return name
+    except Exception as e:
+        print(f"==> Claude API request error: {e}", flush=True)
+        return None
+
+
+def get_spawn_image_url(message: discord.Message) -> str | None:
+    for embed in message.embeds:
+        if embed.image and embed.image.url:
+            return embed.image.url
+        if embed.thumbnail and embed.thumbnail.url:
+            return embed.thumbnail.url
     return None
 
 
@@ -90,9 +117,6 @@ def is_spawn_message(message: discord.Message) -> bool:
     for embed in message.embeds:
         title = (embed.title or "").lower()
         desc  = (embed.description or "").lower()
-        if "wild pokémon" in title or "wild pokémon" in desc:
-            return True
-        # also catch "A wild pokémon has appeared!" style
         if "wild" in title and "pokémon" in title:
             return True
         if "wild" in desc and "pokémon" in desc:
@@ -124,14 +148,15 @@ async def run_bot():
 
             print(f"==> Spawn detected in #{message.channel}", flush=True)
 
-            # Log all embed image URLs to help debug
-            for embed in message.embeds:
-                print(f"==> Embed title: {embed.title}", flush=True)
-                print(f"==> Embed image: {embed.image and embed.image.url}", flush=True)
-                print(f"==> Embed thumbnail: {embed.thumbnail and embed.thumbnail.url}", flush=True)
+            image_url = get_spawn_image_url(message)
+            if not image_url:
+                print("==> No image found in embed.", flush=True)
+                return
+
+            print(f"==> Identifying image: {image_url}", flush=True)
 
             async with aiohttp.ClientSession() as session:
-                name = await identify_pokemon(message, session)
+                name = await identify_pokemon_from_image(image_url, session)
 
             if name:
                 await message.channel.send(
