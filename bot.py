@@ -35,7 +35,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 # MongoDB
-mongo_client = AsyncIOMotorClient(MONGO_URI)
+mongo_client = AsyncIOMotorClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
 db = mongo_client["pokebot"]
 collection = db["learned"]
 
