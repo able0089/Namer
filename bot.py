@@ -30,7 +30,7 @@ intents.message_content = True
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-1.5-flash:generateContent?key={key}"
+    "gemini-2.0-flash-lite:generateContent?key={key}"
 )
 
 
