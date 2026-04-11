@@ -1,9 +1,11 @@
 import asyncio
 import os
 import sys
-import base64
+import io
+import math
 import discord
 import aiohttp
+from PIL import Image
 
 print("==> bot.py starting up", flush=True)
 
@@ -13,14 +15,12 @@ if not TOKEN:
     print("FATAL: DISCORD_TOKEN not set!", flush=True)
     sys.exit(1)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("FATAL: GEMINI_API_KEY not set!", flush=True)
-    sys.exit(1)
-
 POKETWO_BOT_ID = 716390085896962058
 _raw = os.environ.get("WATCH_CHANNEL_IDS", "")
 WATCH_CHANNEL_IDS: set[int] = {int(x) for x in _raw.split(",") if x.strip()}
+
+HASH_SIZE = 16
+MAX_POKEMON = 1025
 
 print("==> Config loaded.", flush=True)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -28,69 +28,106 @@ print("==> Config loaded.", flush=True)
 intents = discord.Intents.default()
 intents.message_content = True
 
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash-lite:generateContent?key={key}"
-)
+# {name: phash}
+sprite_db: dict[str, list[int]] = {}
 
 
-# ── AI IMAGE IDENTIFICATION ───────────────────────────────────────────────────
+# ── IMAGE HASHING ─────────────────────────────────────────────────────────────
 
-async def identify_pokemon_from_image(image_url: str, session: aiohttp.ClientSession) -> str | None:
-    # Download the spawn image
+def phash(img: Image.Image, size: int = HASH_SIZE) -> list[int]:
+    img = img.convert("RGBA")
+    # Paste onto white background to flatten transparency
+    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    bg.paste(img, mask=img.split()[3])
+    img = bg.convert("L").resize((size, size), Image.LANCZOS)
+    pixels = list(img.getdata())
+    avg = sum(pixels) / len(pixels)
+    return [1 if p > avg else 0 for p in pixels]
+
+def hamming(h1: list[int], h2: list[int]) -> int:
+    return sum(b1 != b2 for b1, b2 in zip(h1, h2))
+
+
+# ── SPRITE DATABASE ───────────────────────────────────────────────────────────
+
+async def build_sprite_db(session: aiohttp.ClientSession):
+    global sprite_db
+
+    print("==> Fetching Pokémon list from PokéAPI…", flush=True)
+    async with session.get(
+        f"https://pokeapi.co/api/v2/pokemon?limit={MAX_POKEMON}",
+        timeout=aiohttp.ClientTimeout(total=30)
+    ) as resp:
+        data = await resp.json()
+        pokemon_list = data["results"]
+
+    print(f"==> Downloading HOME sprites for {len(pokemon_list)} Pokémon…", flush=True)
+
+    success = 0
+    for entry in pokemon_list:
+        name = entry["name"]
+        dex_id = entry["url"].rstrip("/").split("/")[-1]
+
+        # Use HOME sprites — same art style as Poketwo spawns
+        url = f"https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/home/{dex_id}.png"
+
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    continue
+                img_bytes = await resp.read()
+                img = Image.open(io.BytesIO(img_bytes))
+                sprite_db[name] = phash(img)
+                success += 1
+        except Exception as e:
+            pass
+
+        if success % 100 == 0 and success > 0:
+            print(f"==> {success} sprites loaded…", flush=True)
+            await asyncio.sleep(0.3)
+
+    print(f"==> ✅ Sprite DB ready! {success} Pokémon loaded.", flush=True)
+
+
+# ── IDENTIFICATION ────────────────────────────────────────────────────────────
+
+async def identify_pokemon(image_url: str, session: aiohttp.ClientSession) -> str | None:
+    if not sprite_db:
+        print("==> Sprite DB not ready.", flush=True)
+        return None
+
     try:
         async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
-                print(f"==> Failed to download image: {resp.status}", flush=True)
                 return None
-            image_bytes = await resp.read()
-            content_type = resp.content_type or "image/jpeg"
+            img_bytes = await resp.read()
+            img = Image.open(io.BytesIO(img_bytes))
     except Exception as e:
-        print(f"==> Image download error: {e}", flush=True)
+        print(f"==> Failed to fetch spawn image: {e}", flush=True)
         return None
 
-    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    spawn_hash = phash(img)
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": content_type,
-                            "data": image_b64,
-                        }
-                    },
-                    {
-                        "text": (
-                            "This is a Pokémon from the game. "
-                            "Reply with ONLY the Pokémon's English name, nothing else. "
-                            "No punctuation, no explanation, just the name."
-                        )
-                    },
-                ]
-            }
-        ]
-    }
+    best_name = None
+    best_dist = math.inf
+    for name, h in sprite_db.items():
+        d = hamming(spawn_hash, h)
+        if d < best_dist:
+            best_dist = d
+            best_name = name
 
-    try:
-        url = GEMINI_URL.format(key=GEMINI_API_KEY)
-        async with session.post(
-            url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                print(f"==> Gemini API error {resp.status}: {data}", flush=True)
-                return None
-            name = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            print(f"==> Gemini identified: {name}", flush=True)
-            return name
-    except Exception as e:
-        print(f"==> Gemini request error: {e}", flush=True)
+    max_bits = HASH_SIZE * HASH_SIZE
+    confidence = round((1 - best_dist / max_bits) * 100, 1)
+    print(f"==> Best match: {best_name} ({confidence}% confidence)", flush=True)
+
+    if confidence < 55:
+        print("==> Confidence too low.", flush=True)
         return None
 
+    return best_name.capitalize()
+
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def get_spawn_image_url(message: discord.Message) -> str | None:
     for embed in message.embeds:
@@ -99,7 +136,6 @@ def get_spawn_image_url(message: discord.Message) -> str | None:
         if embed.thumbnail and embed.thumbnail.url:
             return embed.thumbnail.url
     return None
-
 
 def is_spawn_message(message: discord.Message) -> bool:
     if message.author.id != POKETWO_BOT_ID:
@@ -141,10 +177,8 @@ async def run_bot():
             if not image_url:
                 return
 
-            print(f"==> Identifying: {image_url}", flush=True)
-
             async with aiohttp.ClientSession() as session:
-                name = await identify_pokemon_from_image(image_url, session)
+                name = await identify_pokemon(image_url, session)
 
             if name:
                 await message.channel.send(
@@ -162,7 +196,7 @@ async def run_bot():
         try:
             print(f"==> Attempt {attempt}: Connecting to Discord…", flush=True)
             await client.start(TOKEN)
-            print("==> Bot disconnected. Reconnecting in 30 s…", flush=True)
+            print("==> Disconnected. Reconnecting in 30 s…", flush=True)
             await asyncio.sleep(30)
 
         except discord.LoginFailure:
@@ -170,7 +204,7 @@ async def run_bot():
             sys.exit(1)
 
         except Exception as e:
-            print(f"==> Connection failed (attempt {attempt}): {e}", flush=True)
+            print(f"==> Connection error: {e}", flush=True)
             print(f"==> Retrying in {delay} s…", flush=True)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 120)
@@ -179,8 +213,12 @@ async def run_bot():
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    print("==> Waiting 5 s before Discord login…", flush=True)
+    print("==> Waiting 5 s before startup…", flush=True)
     await asyncio.sleep(5)
+
+    async with aiohttp.ClientSession() as session:
+        await build_sprite_db(session)
+
     await run_bot()
 
 asyncio.run(main())
