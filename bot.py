@@ -25,7 +25,6 @@ print(f"==> Config loaded. PORT={PORT}", flush=True)
 
 intents = discord.Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
 
 
 # ── KEEP-ALIVE WEB SERVER ─────────────────────────────────────────────────────
@@ -73,68 +72,82 @@ def is_spawn_message(message: discord.Message) -> bool:
     return False
 
 
-# ── DISCORD EVENTS ────────────────────────────────────────────────────────────
+# ── DISCORD BOT ───────────────────────────────────────────────────────────────
 
-@client.event
-async def on_ready():
-    print(f"==> Logged in as {client.user} (ID: {client.user.id})", flush=True)
-    print("==> Watching for Poketwo spawns…", flush=True)
+async def run_bot():
+    """Create a fresh client and connect. Retries on rate limit."""
+    delay = 10  # seconds between retries
+    attempt = 0
 
-@client.event
-async def on_message(message: discord.Message):
-    if WATCH_CHANNEL_IDS and message.channel.id not in WATCH_CHANNEL_IDS:
-        return
-    if not is_spawn_message(message):
-        return
+    while True:
+        attempt += 1
+        client = discord.Client(intents=intents)
 
-    image_urls: list[str] = []
-    for embed in message.embeds:
-        if embed.image and embed.image.url:
-            image_urls.append(embed.image.url)
-        if embed.thumbnail and embed.thumbnail.url:
-            image_urls.append(embed.thumbnail.url)
+        @client.event
+        async def on_ready():
+            print(f"==> Logged in as {client.user} (ID: {client.user.id})", flush=True)
+            print("==> Watching for Poketwo spawns…", flush=True)
 
-    if not image_urls:
-        return
-
-    async with aiohttp.ClientSession() as session:
-        for url in image_urls:
-            identifier = extract_pokemon_name_from_url(url)
-            if identifier:
-                name = await resolve_pokemon(identifier, session)
-                await message.channel.send(
-                    f"🔍 That's **{name}**!",
-                    reference=message,
-                    mention_author=False,
-                )
+        @client.event
+        async def on_message(message: discord.Message):
+            if WATCH_CHANNEL_IDS and message.channel.id not in WATCH_CHANNEL_IDS:
+                return
+            if not is_spawn_message(message):
                 return
 
-    await message.channel.send(
-        "🤔 I spotted a spawn but couldn't identify the Pokémon from the image URL.",
-        reference=message,
-        mention_author=False,
-    )
+            image_urls: list[str] = []
+            for embed in message.embeds:
+                if embed.image and embed.image.url:
+                    image_urls.append(embed.image.url)
+                if embed.thumbnail and embed.thumbnail.url:
+                    image_urls.append(embed.thumbnail.url)
+
+            if not image_urls:
+                return
+
+            async with aiohttp.ClientSession() as session:
+                for url in image_urls:
+                    identifier = extract_pokemon_name_from_url(url)
+                    if identifier:
+                        name = await resolve_pokemon(identifier, session)
+                        await message.channel.send(
+                            f"🔍 That's **{name}**!",
+                            reference=message,
+                            mention_author=False,
+                        )
+                        return
+
+            await message.channel.send(
+                "🤔 I spotted a spawn but couldn't identify the Pokémon.",
+                reference=message,
+                mention_author=False,
+            )
+
+        try:
+            print(f"==> Attempt {attempt}: Connecting to Discord…", flush=True)
+            await client.start(TOKEN)
+            # If client.start() returns normally (e.g. logout), restart
+            print("==> Bot disconnected cleanly. Reconnecting in 30 s…", flush=True)
+            await asyncio.sleep(30)
+
+        except discord.LoginFailure:
+            print("FATAL: Invalid token. Regenerate it in the Discord Developer Portal.", flush=True)
+            sys.exit(1)  # No point retrying — token is wrong
+
+        except Exception as e:
+            print(f"==> Connection failed (attempt {attempt}): {e}", flush=True)
+            traceback.print_exc()
+            print(f"==> Retrying in {delay} s…", flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120)  # exponential backoff, cap at 2 min
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    try:
-        print("==> Starting web server…", flush=True)
-        await start_webserver()
-
-        print("==> Waiting 5 s before Discord login…", flush=True)
-        await asyncio.sleep(5)
-
-        print("==> Connecting to Discord…", flush=True)
-        await client.start(TOKEN)
-
-    except discord.LoginFailure:
-        print("FATAL: Invalid Discord token. Check your DISCORD_TOKEN env var.", flush=True)
-        sys.exit(1)
-    except Exception as e:
-        print(f"FATAL: Unexpected error: {e}", flush=True)
-        traceback.print_exc()
-        sys.exit(1)
+    await start_webserver()
+    print("==> Waiting 10 s before first Discord login attempt…", flush=True)
+    await asyncio.sleep(10)
+    await run_bot()  # loops forever, retrying on failure
 
 asyncio.run(main())
