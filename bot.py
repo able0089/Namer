@@ -7,7 +7,6 @@ import json
 import base64
 import discord
 import aiohttp
-from PIL import Image
 from aiohttp import web as aiohttp_web
 
 print("==> bot.py starting up", flush=True)
@@ -19,10 +18,11 @@ if not TOKEN:
     sys.exit(1)
 
 GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN")
+HF_TOKEN       = os.environ.get("HF_TOKEN")  # Hugging Face token
 GITHUB_REPO    = "able0089/Namer"
 DB_FILE_PATH   = "learned.json"
 POKETWO_BOT_ID = 716390085896962058
-HF_MODEL       = "imzynoxprince/pokemons-image-classifier-gen1-gen9"
+HF_API_URL     = "https://api-inference.huggingface.co/models/imzynoxprince/pokemons-image-classifier-gen1-gen9"
 
 _raw = os.environ.get("WATCH_CHANNEL_IDS", "")
 WATCH_CHANNEL_IDS: set[int] = {int(x) for x in _raw.split(",") if x.strip()}
@@ -36,45 +36,54 @@ intents.message_content = True
 last_spawn:    dict[int, tuple[str, discord.Message]] = {}
 learned_names: set[str] = set()
 github_sha:    str | None = None
-classifier    = None  # will be loaded at startup
+bot_start_time: float = 0.0
 
 
-# ── AI MODEL ──────────────────────────────────────────────────────────────────
-
-def load_model():
-    global classifier
-    try:
-        from transformers import pipeline
-        print("==> Loading Pokémon classifier model…", flush=True)
-        classifier = pipeline(
-            "image-classification",
-            model=HF_MODEL,
-            device=-1,  # CPU
-        )
-        print("==> Model loaded! Ready to identify Pokémon.", flush=True)
-    except Exception as e:
-        print(f"==> Model load error: {e}", flush=True)
-        classifier = None
+# ── HF INFERENCE API ──────────────────────────────────────────────────────────
 
 async def identify_pokemon(image_url: str, session: aiohttp.ClientSession) -> tuple[str | None, float]:
-    """Use the ViT model to identify a Pokémon from an image URL."""
-    if classifier is None:
-        return None, 0.0
+    """Send image to HuggingFace Inference API — runs on HF servers, zero memory cost."""
     try:
+        # Download spawn image
         async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 return None, 0.0
             img_bytes = await resp.read()
-        img  = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, lambda: classifier(img, top_k=1))
-        if results:
-            name       = results[0]["label"].replace("-", " ").title()
-            confidence = round(results[0]["score"] * 100, 1)
-            return name, confidence
+
+        # Send to HF API
+        headers = {}
+        if HF_TOKEN:
+            headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+        async with session.post(
+            HF_API_URL,
+            data=img_bytes,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status == 503:
+                # Model is loading, wait and retry once
+                print("==> HF model loading, retrying in 10s…", flush=True)
+                await asyncio.sleep(10)
+                async with session.post(HF_API_URL, data=img_bytes, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=30)) as resp2:
+                    result = await resp2.json()
+            else:
+                result = await resp.json()
+
+            if isinstance(result, list) and result:
+                top = result[0]
+                name       = top["label"].replace("-", " ").title()
+                confidence = round(top["score"] * 100, 1)
+                print(f"==> HF identified: {name} ({confidence}%)", flush=True)
+                return name, confidence
+
+            print(f"==> HF unexpected response: {result}", flush=True)
+            return None, 0.0
+
     except Exception as e:
-        print(f"==> Identification error: {e}", flush=True)
-    return None, 0.0
+        print(f"==> HF API error: {e}", flush=True)
+        return None, 0.0
 
 
 # ── GITHUB PERSISTENCE ────────────────────────────────────────────────────────
@@ -99,7 +108,7 @@ async def load_from_github(session: aiohttp.ClientSession):
             github_sha = data["sha"]
             content    = base64.b64decode(data["content"]).decode("utf-8")
             learned_names = set(json.loads(content))
-            print(f"==> Loaded {len(learned_names)} learned Pokémon from GitHub.", flush=True)
+            print(f"==> Loaded {len(learned_names)} learned Pokémon.", flush=True)
     except Exception as e:
         print(f"==> GitHub load error: {e}", flush=True)
 
@@ -219,6 +228,7 @@ async def start_webserver():
 # ── DISCORD BOT ───────────────────────────────────────────────────────────────
 
 async def run_bot():
+    global bot_start_time
     delay   = 10
     attempt = 0
 
@@ -228,6 +238,9 @@ async def run_bot():
 
         @client.event
         async def on_ready():
+            global bot_start_time
+            import time
+            bot_start_time = time.time()
             print(f"==> Logged in as {client.user} (ID: {client.user.id})", flush=True)
             print(f"==> Ready! Known Pokémon: {len(learned_names)}", flush=True)
 
@@ -246,7 +259,6 @@ async def run_bot():
 
                 fled_name = extract_fled_name(message)
                 if fled_name and channel_id in last_spawn:
-                    _, prev_bot_msg = last_spawn[channel_id]
                     async with aiohttp.ClientSession() as session:
                         english = await teach(fled_name, "fled", session)
                     await message.channel.send(f"✅ Learned: **{english}**!")
@@ -259,7 +271,6 @@ async def run_bot():
                     name, confidence = await identify_pokemon(image_url, session)
 
                 if name and confidence >= 50:
-                    print(f"==> Identified: {name} ({confidence}%)", flush=True)
                     bot_msg = await message.channel.send(
                         f"🔍 That's **{name}**! *({confidence}% confidence)*",
                         reference=message,
@@ -267,7 +278,7 @@ async def run_bot():
                     )
                 else:
                     bot_msg = await message.channel.send(
-                        f"❓ Unknown Pokémon! *(use !correct Name to teach me)*",
+                        f"❓ Unknown! *(use !correct Name to teach me)*",
                         reference=message,
                         mention_author=False,
                     )
@@ -285,6 +296,17 @@ async def run_bot():
                     last_spawn.pop(channel_id, None)
                 return
 
+            # ── !ping ─────────────────────────────────────────────────────────
+            if message.content.lower() == "!ping":
+                import time
+                latency = round(client.latency * 1000)
+                uptime_secs = int(time.time() - bot_start_time)
+                h, m, s = uptime_secs // 3600, (uptime_secs % 3600) // 60, uptime_secs % 60
+                await message.channel.send(
+                    f"🏓 Pong! **{latency}ms** | Uptime: {h}h {m}m {s}s"
+                )
+                return
+
             # ── !guess ────────────────────────────────────────────────────────
             if message.content.lower() == "!guess" and message.reference:
                 try:
@@ -298,7 +320,7 @@ async def run_bot():
                     return
                 async with aiohttp.ClientSession() as session:
                     name, confidence = await identify_pokemon(image_url, session)
-                if name:
+                if name and confidence >= 50:
                     bot_msg = await message.channel.send(
                         f"🔍 That's **{name}**! *({confidence}% confidence)*"
                     )
@@ -310,11 +332,13 @@ async def run_bot():
             # ── !correct ──────────────────────────────────────────────────────
             if message.content.lower().startswith("!correct "):
                 raw_name = message.content[9:].strip()
-                if raw_name and channel_id in last_spawn:
+                if raw_name:
                     async with aiohttp.ClientSession() as session:
                         english = await teach(raw_name, "manual", session)
                     await message.channel.send(f"✅ Learned: **{english}**! *(corrected)*")
                     await message.add_reaction("✅")
+                    if channel_id in last_spawn:
+                        last_spawn.pop(channel_id, None)
                 else:
                     await message.add_reaction("❌")
 
@@ -338,9 +362,6 @@ async def main():
     await start_webserver()
     print("==> Waiting 5s…", flush=True)
     await asyncio.sleep(5)
-    # Load model in thread so it doesn't block
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, load_model)
     async with aiohttp.ClientSession() as session:
         await load_from_github(session)
     await run_bot()
